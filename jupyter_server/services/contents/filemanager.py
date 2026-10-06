@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hashlib
+import json
 import math
 import mimetypes
 import os
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import typing as t
 import warnings
+from base64 import decodebytes
 from datetime import datetime
 from pathlib import Path
 
@@ -33,7 +36,8 @@ from jupyter_server.utils import to_api_path
 
 from .filecheckpoints import AsyncFileCheckpoints, FileCheckpoints
 from .fileio import AsyncFileManagerMixin, FileManagerMixin
-from .manager import AsyncContentsManager, ContentsManager, copy_pat
+from .leases import LeaseError
+from .manager import AsyncContentsManager, ContentsManager, LeaseHTTPError, copy_pat
 
 try:
     from os.path import samefile
@@ -411,7 +415,39 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         else:
             self.log.debug("Directory %r already exists", os_path)
 
-    def save(self, model, path=""):
+    def _lease_fingerprint(self, path):
+        """Storage fingerprint used to spot out-of-band file modifications."""
+        os_path = self._get_os_path(path)
+        try:
+            st = os.stat(os_path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    @staticmethod
+    def _model_content_hash(model):
+        """Stable sha256 of a save's content (for duplicate-submission dedup).
+
+        Notebooks are hashed from their canonical JSON representation rather
+        than parsed with nbformat: hashing must not validate or mutate the
+        model, and retried submissions carry byte-identical JSON.
+        """
+        try:
+            if model.get("type") == "notebook":
+                payload = json.dumps(model["content"], sort_keys=True, default=str).encode("utf-8")
+            elif model.get("type") == "file":
+                if model.get("format") == "base64":
+                    payload = decodebytes(model["content"].encode("ascii"))
+                else:
+                    payload = model["content"].encode("utf-8")
+            else:
+                return None
+        except Exception:
+            # Unparseable content: let the normal save path validate it.
+            return None
+        return hashlib.sha256(payload).hexdigest()
+
+    def save(self, model, path="", credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
 
@@ -425,6 +461,30 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
 
         if not self.allow_hidden and is_hidden(os_path, self.root_dir):
             raise web.HTTPError(400, f"Cannot create file or directory {os_path!r}")
+
+        # Lease fencing: reject stale generations, dead tokens, duplicate
+        # submissions and files changed outside the API before writing.
+        lease_record = None
+        content_hash = self._model_content_hash(model) if model["type"] != "directory" else None
+        if model["type"] != "directory":
+            if credentials is None:
+                # A document that is open for editing cannot be written
+                # without a token; with no lease open the legacy API works.
+                self._check_lease(path, None)
+            else:
+                try:
+                    lease_record, already_committed = self.lease_store.prepare_write(
+                        path,
+                        credentials,
+                        current_key=self._lease_fingerprint(path),
+                        content_hash=content_hash,
+                    )
+                except LeaseError as e:
+                    raise LeaseHTTPError(e.conflict) from e
+                if already_committed:
+                    # Identical retried request: answer idempotently, no rewrite.
+                    existing = self.get(path, content=False)
+                    return self._attach_lease_info(existing, path, lease_record)
 
         self.log.debug("Saving %s", os_path)
 
@@ -450,6 +510,16 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
             self.log.error("Error while saving file: %s %s", path, e, exc_info=True)
             raise web.HTTPError(500, f"Unexpected error while saving file: {path} {e}") from e
 
+        if lease_record is not None:
+            # Advance the write version and the external-modification
+            # baseline. Saving does not extend the lease TTL.
+            self.lease_store.commit_write(
+                path,
+                lease_record.token,
+                new_key=self._lease_fingerprint(path),
+                content_hash=content_hash,
+            )
+
         validation_message = None
         if model["type"] == "notebook":
             self.validate_notebook_model(model, validation_error=validation_error)
@@ -461,7 +531,7 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
 
         self.run_post_save_hooks(model=model, os_path=os_path)
         self.emit(data={"action": "save", "path": path})
-        return model
+        return self._attach_lease_info(model, path, lease_record)
 
     def delete_file(self, path):
         """项目内部接口说明。"""
@@ -825,7 +895,7 @@ class AsyncFileContentsManager(  # type: ignore[misc]
         else:
             self.log.debug("Directory %r already exists", os_path)
 
-    async def save(self, model, path=""):
+    async def save(self, model, path="", credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
 
@@ -838,6 +908,25 @@ class AsyncFileContentsManager(  # type: ignore[misc]
 
         os_path = self._get_os_path(path)
         self.log.debug("Saving %s", os_path)
+
+        lease_record = None
+        content_hash = self._model_content_hash(model) if model["type"] != "directory" else None
+        if model["type"] != "directory":
+            if credentials is None:
+                self._check_lease(path, None)
+            else:
+                try:
+                    lease_record, already_committed = self.lease_store.prepare_write(
+                        path,
+                        credentials,
+                        current_key=self._lease_fingerprint(path),
+                        content_hash=content_hash,
+                    )
+                except LeaseError as e:
+                    raise LeaseHTTPError(e.conflict) from e
+                if already_committed:
+                    existing = await self.get(path, content=False)
+                    return self._attach_lease_info(existing, path, lease_record)
 
         validation_error: dict[str, t.Any] = {}
         try:
@@ -861,6 +950,14 @@ class AsyncFileContentsManager(  # type: ignore[misc]
             self.log.error("Error while saving file: %s %s", path, e, exc_info=True)
             raise web.HTTPError(500, f"Unexpected error while saving file: {path} {e}") from e
 
+        if lease_record is not None:
+            self.lease_store.commit_write(
+                path,
+                lease_record.token,
+                new_key=self._lease_fingerprint(path),
+                content_hash=content_hash,
+            )
+
         validation_message = None
         if model["type"] == "notebook":
             self.validate_notebook_model(model, validation_error=validation_error)
@@ -872,7 +969,7 @@ class AsyncFileContentsManager(  # type: ignore[misc]
 
         self.run_post_save_hooks(model=model, os_path=os_path)
         self.emit(data={"action": "save", "path": path})
-        return model
+        return self._attach_lease_info(model, path, lease_record)
 
     async def delete_file(self, path):
         """项目内部接口说明。"""

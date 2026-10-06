@@ -22,6 +22,7 @@ from traitlets import (
     Any,
     Bool,
     Dict,
+    Float,
     Instance,
     List,
     TraitError,
@@ -38,8 +39,26 @@ from jupyter_server.utils import import_item
 
 from ...files.handlers import FilesHandler
 from .checkpoints import AsyncCheckpoints, Checkpoints
+from .leases import LeaseConflictReason, LeaseCredentials, LeaseError, LeaseStore
 
 copy_pat = re.compile(r"\-Copy\d*\.")
+
+
+class LeaseHTTPError(HTTPError):
+    """An HTTP 409 carrying structured, recoverable lease-conflict info.
+
+    Handlers serialize :attr:`lease_conflict` as JSON so callers can decide
+    how to recover (re-open, merge, refresh) instead of treating the response
+    as an opaque save failure.
+    """
+
+    def __init__(self, conflict, status_code: int = 409):
+        self.lease_conflict = conflict.to_dict()
+        super().__init__(
+            status_code,
+            conflict.message,
+            reason="lease_conflict",
+        )
 
 
 class ContentsManager(LoggingConfigurable):
@@ -62,6 +81,141 @@ class ContentsManager(LoggingConfigurable):
     def emit(self, data):
         """项目内部接口说明。"""
         self.event_logger.emit(schema_id=self.event_schema_id, data=data)
+
+    # -- Edit leases (fencing tokens) --------------------------------------
+
+    lease_ttl_seconds = Float(
+        300.0,
+        config=True,
+        help="""Time after which an idle edit lease expires. Clients are
+        expected to renew before this deadline; a clock-skew grace is added
+        server-side so a slightly slow client never loses a live lease.""",
+    )
+
+    lease_clock_skew_grace_seconds = Float(
+        30.0,
+        config=True,
+        help="Extra lifetime granted past a lease deadline to tolerate client/server clock drift.",
+    )
+
+    lease_store = Instance(LeaseStore)
+
+    @default("lease_store")
+    def _default_lease_store(self):
+        return LeaseStore(
+            ttl_seconds=self.lease_ttl_seconds,
+            clock_skew_grace_seconds=self.lease_clock_skew_grace_seconds,
+        )
+
+    def _owner_name(self, owner: str | None = None) -> str:
+        if owner:
+            return owner
+        # Filled in by handlers via the keyword argument; fall back keeps the
+        # manager usable when driven directly (tests, other services).
+        return "unknown"
+
+    def open_lease(self, path, owner, *, known_generation=None, owner_label=None):
+        """Open an edit lease (fencing token) on ``path``."""
+        path = path.strip("/")
+        try:
+            record = self.lease_store.acquire(
+                path,
+                self._owner_name(owner),
+                known_generation=known_generation,
+                owner_label=owner_label,
+            )
+            key = self._lease_fingerprint(path)
+            if key is not None:
+                self.lease_store.set_baseline(path, record.token, key)
+            return record
+        except LeaseError as e:
+            raise LeaseHTTPError(e.conflict) from e
+
+    def renew_lease(self, path, credentials):
+        """Renew a lease without changing its token or generation."""
+        try:
+            return self.lease_store.renew(
+                path.strip("/"),
+                credentials.token,
+                expected_generation=credentials.generation,
+            )
+        except LeaseError as e:
+            raise LeaseHTTPError(e.conflict) from e
+
+    def release_lease(self, path, credentials):
+        """Close a lease. Idempotent for already-dead tokens."""
+        try:
+            self.lease_store.release(path.strip("/"), credentials.token)
+        except LeaseError as e:
+            raise LeaseHTTPError(e.conflict) from e
+
+    def takeover_lease(self, path, *, admin, reason, owner_label=None):
+        """Revoke the current lease as an administrator; reason is recorded."""
+        path = path.strip("/")
+        prior = self.lease_store.get(path)
+        prior_owner = prior.current.owner if prior is not None and prior.current else None
+        try:
+            record = self.lease_store.takeover(
+                path,
+                admin=self._owner_name(admin),
+                reason=reason,
+                owner_label=owner_label,
+            )
+        except LeaseError as e:
+            raise LeaseHTTPError(e.conflict) from e
+        # Administrative actions are audited: who took over, whose lease was
+        # revoked and the mandatory reason. The reason is also stored on the
+        # dead token's tombstone, surfaced to the evicted client on next use.
+        self.log.warning(
+            "Edit lease on %r taken over by admin %r from %r; reason: %s",
+            path,
+            record.owner,
+            prior_owner,
+            reason.strip(),
+        )
+        # The new owner inherits the file as it is on disk right now;
+        # any earlier out-of-band state becomes its baseline.
+        key = self._lease_fingerprint(path)
+        if key is not None:
+            self.lease_store.set_baseline(path, record.token, key)
+        return record
+
+    def lease_model(self, path):
+        """Public lease state for a contents model (never exposes other tokens)."""
+        return self.lease_store.model_for(path.strip("/"))
+
+    def _check_lease(self, path, credentials):
+        """Validate credentials for a mutating op; raises 409 on failure."""
+        try:
+            return self.lease_store.check(
+                path.strip("/"),
+                credentials.token if credentials is not None else None,
+                expected_generation=credentials.generation if credentials is not None else None,
+                permit_when_absent=credentials is None,
+            )
+        except LeaseError as e:
+            raise LeaseHTTPError(e.conflict) from e
+
+    def _lease_fingerprint(self, path):
+        """Opaque fingerprint of the stored document.
+
+        Subclasses override this to detect out-of-band modifications (e.g.
+        ``(mtime_ns, size)`` for local files).  Returning ``None`` disables
+        external-modification detection for a manager.
+        """
+        return None
+
+    def _attach_lease_info(self, model, path, record=None):
+        """Expose non-secret lease state on a returned contents model."""
+        if model is None:
+            return model
+        info = self.lease_store.model_for(path.strip("/"))
+        if info is not None:
+            # Never leak the fencing token through a contents model; it only
+            # travels in dedicated lease responses/headers.
+            info.pop("token", None)
+            model["lease"] = info
+        return model
 
     root_dir = Unicode("/", config=True)
 
@@ -375,7 +529,7 @@ class ContentsManager(LoggingConfigurable):
         """项目内部接口说明。"""
         raise NotImplementedError
 
-    def save(self, model, path):
+    def save(self, model, path, credentials=None):
         """项目内部接口说明。"""
         raise NotImplementedError
 
@@ -390,29 +544,46 @@ class ContentsManager(LoggingConfigurable):
     # ContentsManager API part 2: methods that have usable default
     # implementations, but can be overridden in subclasses.
 
-    def delete(self, path):
+    def delete(self, path, credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
+        record = self._check_lease(path, credentials)
         self.delete_file(path)
         self.checkpoints.delete_all_checkpoints(path)
+        if record is not None:
+            # The document is gone: close the lease and kill its token so a
+            # reconnecting client cannot fence a delete-then-recreate file.
+            self.lease_store.release(path, record.token)
         self.emit(data={"action": "delete", "path": path})
 
-    def rename(self, old_path, new_path):
+    def rename(self, old_path, new_path, credentials=None):
         """项目内部接口说明。"""
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        record = self._check_lease(old_path, credentials)
+        try:
+            # Refuse to move onto a name another client has open.
+            self.lease_store.check_rename_destination(new_path)
+        except LeaseError as e:
+            raise LeaseHTTPError(e.conflict) from e
         self.rename_file(old_path, new_path)
         self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        if record is not None:
+            # The lease (and all dead tokens) follows the document so the
+            # client keeps fencing with the same generation at the new name.
+            self.lease_store.move(old_path, new_path)
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
-    def update(self, model, path):
+    def update(self, model, path, credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         new_path = model.get("path", path).strip("/")
         if path != new_path:
-            self.rename(path, new_path)
+            self.rename(path, new_path, credentials=credentials)
         model = self.get(new_path, content=False)
-        return model
+        return self._attach_lease_info(model, new_path)
 
     def info_string(self):
         """项目内部接口说明。"""
@@ -491,7 +662,7 @@ class ContentsManager(LoggingConfigurable):
         path = f"{path}/{name}"
         return self.new(model, path)
 
-    def new(self, model=None, path=""):
+    def new(self, model=None, path="", credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if model is None:
@@ -512,7 +683,7 @@ class ContentsManager(LoggingConfigurable):
                 model["type"] = "file"
                 model["format"] = "text"
 
-        model = self.save(model, path)
+        model = self.save(model, path, credentials=credentials)
         return model
 
     def copy(self, from_path, to_path=None):
@@ -600,13 +771,38 @@ class ContentsManager(LoggingConfigurable):
         return not any(fnmatch(name, glob) for glob in self.hide_globs)
 
     # Part 3: Checkpoints API
+    def _annotate_checkpoint_lease(self, model, path):
+        """Associate a checkpoint with the current lease version.
+
+        Purely informational: snapshotting never extends the lease TTL, never
+        bumps the write version and never requires a token.
+        """
+        entry = self.lease_store.get(path.strip("/"))
+        if entry is not None and entry.current is not None:
+            cur = entry.current
+            model["lease_generation"] = cur.generation
+            model["lease_version"] = cur.lease_version
+        return model
+
     def create_checkpoint(self, path):
         """项目内部接口说明。"""
-        return self.checkpoints.create_checkpoint(self, path)
+        model = self.checkpoints.create_checkpoint(self, path)
+        return self._annotate_checkpoint_lease(model, path)
 
-    def restore_checkpoint(self, checkpoint_id, path):
+    def restore_checkpoint(self, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
-        self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        path = path.strip("/")
+        backend = self.checkpoints
+        uses_save = getattr(backend, "restore_uses_save", False)
+        record = None
+        if not uses_save:
+            # Byte-copy backends do not fence themselves.
+            record = self._check_lease(path, credentials)
+        backend.restore_checkpoint(self, checkpoint_id, path, credentials=credentials)
+        if record is not None:
+            # The restored content is the new known state of the file; TTL is
+            # unchanged (a restore does not extend the lease).
+            self.lease_store.commit_write(path, record.token, new_key=self._lease_fingerprint(path))
 
     def list_checkpoints(self, path):
         return self.checkpoints.list_checkpoints(path)
@@ -658,7 +854,7 @@ class AsyncContentsManager(ContentsManager):
         """项目内部接口说明。"""
         raise NotImplementedError
 
-    async def save(self, model, path):
+    async def save(self, model, path, credentials=None):
         """项目内部接口说明。"""
         raise NotImplementedError
 
@@ -677,30 +873,42 @@ class AsyncContentsManager(ContentsManager):
         """项目内部接口说明。"""
         return None
 
-    async def delete(self, path):
+    async def delete(self, path, credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
 
+        record = self._check_lease(path, credentials)
         await self.delete_file(path)
         await self.checkpoints.delete_all_checkpoints(path)
+        if record is not None:
+            self.lease_store.release(path, record.token)
         self.emit(data={"action": "delete", "path": path})
 
-    async def rename(self, old_path, new_path):
+    async def rename(self, old_path, new_path, credentials=None):
         """项目内部接口说明。"""
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        record = self._check_lease(old_path, credentials)
+        try:
+            self.lease_store.check_rename_destination(new_path)
+        except LeaseError as e:
+            raise LeaseHTTPError(e.conflict) from e
         await self.rename_file(old_path, new_path)
         await self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        if record is not None:
+            self.lease_store.move(old_path, new_path)
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
-    async def update(self, model, path):
+    async def update(self, model, path, credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         new_path = model.get("path", path).strip("/")
         if path != new_path:
-            await self.rename(path, new_path)
+            await self.rename(path, new_path, credentials=credentials)
         model = await self.get(new_path, content=False)
-        return model
+        return self._attach_lease_info(model, new_path)
 
     async def increment_filename(self, filename, path="", insert=""):
         """项目内部接口说明。"""
@@ -752,7 +960,7 @@ class AsyncContentsManager(ContentsManager):
         path = f"{path}/{name}"
         return await self.new(model, path)
 
-    async def new(self, model=None, path=""):
+    async def new(self, model=None, path="", credentials=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if model is None:
@@ -773,7 +981,7 @@ class AsyncContentsManager(ContentsManager):
                 model["type"] = "file"
                 model["format"] = "text"
 
-        model = await self.save(model, path)
+        model = await self.save(model, path, credentials=credentials)
         return model
 
     async def copy(self, from_path, to_path=None):
@@ -825,11 +1033,20 @@ class AsyncContentsManager(ContentsManager):
     # Part 3: Checkpoints API
     async def create_checkpoint(self, path):
         """项目内部接口说明。"""
-        return await self.checkpoints.create_checkpoint(self, path)
+        model = await self.checkpoints.create_checkpoint(self, path)
+        return self._annotate_checkpoint_lease(model, path)
 
-    async def restore_checkpoint(self, checkpoint_id, path):
+    async def restore_checkpoint(self, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
-        await self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        path = path.strip("/")
+        backend = self.checkpoints
+        uses_save = getattr(backend, "restore_uses_save", False)
+        record = None
+        if not uses_save:
+            record = self._check_lease(path, credentials)
+        await backend.restore_checkpoint(self, checkpoint_id, path, credentials=credentials)
+        if record is not None:
+            self.lease_store.commit_write(path, record.token, new_key=self._lease_fingerprint(path))
 
     async def list_checkpoints(self, path):
         """项目内部接口说明。"""

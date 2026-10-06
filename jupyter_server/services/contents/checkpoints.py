@@ -13,9 +13,15 @@ class Checkpoints(LoggingConfigurable):
         """项目内部接口说明。"""
         raise NotImplementedError
 
-    def restore_checkpoint(self, contents_mgr, checkpoint_id, path):
+    def restore_checkpoint(self, contents_mgr, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
         raise NotImplementedError
+
+    #: True for backends that restore by routing the old content through the
+    #: manager's ``save`` (which performs lease fencing and write-version
+    #: bookkeeping itself). Byte-copying backends (FileCheckpoints) leave
+    #: this False so the manager performs the bookkeeping once.
+    restore_uses_save = False
 
     def rename_checkpoint(self, checkpoint_id, old_path, new_path):
         """项目内部接口说明。"""
@@ -43,6 +49,10 @@ class Checkpoints(LoggingConfigurable):
 class GenericCheckpointsMixin:
     """项目内部接口说明。"""
 
+    #: Restoring goes through ContentsManager.save, which performs lease
+    #: fencing and write-version bookkeeping itself.
+    restore_uses_save = True
+
     def create_checkpoint(self, contents_mgr, path):
         model = contents_mgr.get(path, content=True)
         type_ = model["type"]
@@ -60,7 +70,7 @@ class GenericCheckpointsMixin:
         else:
             raise HTTPError(500, "Unexpected type %s" % type)
 
-    def restore_checkpoint(self, contents_mgr, checkpoint_id, path):
+    def restore_checkpoint(self, contents_mgr, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
         type_ = contents_mgr.get(path, content=False)["type"]
         if type_ == "notebook":
@@ -69,7 +79,7 @@ class GenericCheckpointsMixin:
             model = self.get_file_checkpoint(checkpoint_id, path)
         else:
             raise HTTPError(500, "Unexpected type %s" % type_)
-        contents_mgr.save(model, path)
+        contents_mgr.save(model, path, credentials=credentials)
 
     # Required Methods
     def create_file_checkpoint(self, content, format, path):
@@ -96,7 +106,7 @@ class AsyncCheckpoints(Checkpoints):
         """项目内部接口说明。"""
         raise NotImplementedError
 
-    async def restore_checkpoint(self, contents_mgr, checkpoint_id, path):
+    async def restore_checkpoint(self, contents_mgr, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
         raise NotImplementedError
 
@@ -143,7 +153,7 @@ class AsyncGenericCheckpointsMixin(GenericCheckpointsMixin):
         else:
             raise HTTPError(500, "Unexpected type %s" % type_)
 
-    async def restore_checkpoint(self, contents_mgr, checkpoint_id, path):
+    async def restore_checkpoint(self, contents_mgr, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
         content_model = await contents_mgr.get(path, content=False)
         type_ = content_model["type"]
@@ -153,7 +163,7 @@ class AsyncGenericCheckpointsMixin(GenericCheckpointsMixin):
             model = await self.get_file_checkpoint(checkpoint_id, path)
         else:
             raise HTTPError(500, "Unexpected type %s" % type_)
-        await contents_mgr.save(model, path)
+        await contents_mgr.save(model, path, credentials=credentials)
 
     # Required Methods
     async def create_file_checkpoint(self, content, format, path):

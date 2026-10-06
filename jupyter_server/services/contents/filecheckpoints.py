@@ -50,7 +50,7 @@ class FileCheckpoints(FileManagerMixin, Checkpoints):
         self._copy(src_path, dest_path)
         return self.checkpoint_model(checkpoint_id, dest_path)
 
-    def restore_checkpoint(self, contents_mgr, checkpoint_id, path):
+    def restore_checkpoint(self, contents_mgr, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
         src_path = self.checkpoint_path(checkpoint_id, path)
         dest_path = contents_mgr._get_os_path(path)
@@ -134,7 +134,7 @@ class AsyncFileCheckpoints(FileCheckpoints, AsyncFileManagerMixin, AsyncCheckpoi
         await self._copy(src_path, dest_path)
         return await self.checkpoint_model(checkpoint_id, dest_path)
 
-    async def restore_checkpoint(self, contents_mgr, checkpoint_id, path):
+    async def restore_checkpoint(self, contents_mgr, checkpoint_id, path, credentials=None):
         """项目内部接口说明。"""
         src_path = self.checkpoint_path(checkpoint_id, path)
         dest_path = contents_mgr._get_os_path(path)

@@ -13,7 +13,7 @@ from jupyter_server.services.contents.filemanager import (
 class LargeFileManager(FileContentsManager):
     """项目内部接口说明。"""
 
-    def save(self, model, path=""):
+    def save(self, model, path="", credentials=None):
         """项目内部接口说明。"""
         chunk = model.get("chunk", None)
         if chunk is not None:
@@ -21,6 +21,12 @@ class LargeFileManager(FileContentsManager):
 
             if chunk == 1:
                 self.run_pre_save_hooks(model=model, path=path)
+
+            # Every piece of a chunked upload must carry a live fence if the
+            # client opted into leases. prepare_write() is not used because
+            # the file legitimately changes between pieces; the write version
+            # is bumped once, when the final piece lands.
+            lease_record = self._check_lease(path, credentials)
 
             if "type" not in model:
                 raise web.HTTPError(400, "No file type provided")
@@ -54,10 +60,16 @@ class LargeFileManager(FileContentsManager):
             # Last chunk
             if chunk == -1:
                 self.run_post_save_hooks(model=model, os_path=os_path)
+                if lease_record is not None:
+                    self.lease_store.commit_write(
+                        path,
+                        lease_record.token,
+                        new_key=self._lease_fingerprint(path),
+                    )
             self.emit(data={"action": "save", "path": path})
-            return model
+            return self._attach_lease_info(model, path, lease_record)
         else:
-            return super().save(model, path)
+            return super().save(model, path, credentials=credentials)
 
     def _save_large_file(self, os_path, content, format):
         """项目内部接口说明。"""
@@ -85,7 +97,7 @@ class LargeFileManager(FileContentsManager):
 class AsyncLargeFileManager(AsyncFileContentsManager):
     """项目内部接口说明。"""
 
-    async def save(self, model, path=""):
+    async def save(self, model, path="", credentials=None):
         """项目内部接口说明。"""
         chunk = model.get("chunk", None)
         if chunk is not None:
@@ -93,6 +105,8 @@ class AsyncLargeFileManager(AsyncFileContentsManager):
 
             if chunk == 1:
                 self.run_pre_save_hooks(model=model, path=path)
+
+            lease_record = self._check_lease(path, credentials)
 
             if "type" not in model:
                 raise web.HTTPError(400, "No file type provided")
@@ -126,11 +140,17 @@ class AsyncLargeFileManager(AsyncFileContentsManager):
             # Last chunk
             if chunk == -1:
                 self.run_post_save_hooks(model=model, os_path=os_path)
+                if lease_record is not None:
+                    self.lease_store.commit_write(
+                        path,
+                        lease_record.token,
+                        new_key=self._lease_fingerprint(path),
+                    )
 
             self.emit(data={"action": "save", "path": path})
-            return model
+            return self._attach_lease_info(model, path, lease_record)
         else:
-            return await super().save(model, path)
+            return await super().save(model, path, credentials=credentials)
 
     async def _save_large_file(self, os_path, content, format):
         """项目内部接口说明。"""
