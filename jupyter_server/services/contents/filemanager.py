@@ -157,6 +157,17 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
             self.log.error("Failed to check write permissions on %s", os_path)
             return False
 
+    def _lease_file_state(self, path):
+        """项目内部接口说明。"""
+        os_path = self._get_os_path(path.strip("/"))
+        try:
+            st = os.stat(os_path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return {"mtime_ns": st.st_mtime_ns, "size": st.st_size, "ino": st.st_ino}
+
     def file_exists(self, path: str) -> bool | t.Awaitable[bool]:
         """项目内部接口说明。"""
         path = path.strip("/")
@@ -411,7 +422,17 @@ class FileContentsManager(FileManagerMixin, ContentsManager):
         else:
             self.log.debug("Directory %r already exists", os_path)
 
-    def save(self, model, path=""):
+    def save(self, model, path="", lease=None):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        prior = self._replay_request(path, lease, "save")
+        if prior is not None:
+            self.log.info("Ignoring duplicate save request for %s", path)
+            return self.get(prior["path"], content=False)
+        with self._lease_write_guard(path, lease, "save"):
+            return self._save(model, path)
+
+    def _save(self, model, path=""):
         """项目内部接口说明。"""
         path = path.strip("/")
 
@@ -825,7 +846,17 @@ class AsyncFileContentsManager(  # type: ignore[misc]
         else:
             self.log.debug("Directory %r already exists", os_path)
 
-    async def save(self, model, path=""):
+    async def save(self, model, path="", lease=None):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        prior = self._replay_request(path, lease, "save")
+        if prior is not None:
+            self.log.info("Ignoring duplicate save request for %s", path)
+            return await self.get(prior["path"], content=False)
+        async with self._lease_write_aguard(path, lease, "save"):
+            return await self._save(model, path)
+
+    async def _save(self, model, path=""):
         """项目内部接口说明。"""
         path = path.strip("/")
 

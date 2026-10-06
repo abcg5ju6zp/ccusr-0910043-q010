@@ -10,6 +10,7 @@ import os
 import re
 import typing as t
 import warnings
+from contextlib import asynccontextmanager, contextmanager
 from fnmatch import fnmatch
 
 from jupyter_core.utils import ensure_async, run_sync
@@ -38,6 +39,7 @@ from jupyter_server.utils import import_item
 
 from ...files.handlers import FilesHandler
 from .checkpoints import AsyncCheckpoints, Checkpoints
+from .leases import LeaseConflictError, LeaseManager, supports_lease_kwarg
 
 copy_pat = re.compile(r"\-Copy\d*\.")
 
@@ -319,6 +321,125 @@ class ContentsManager(LoggingConfigurable):
             "log": self.log,
         }
 
+    lease_manager = Instance(LeaseManager)
+
+    @default("lease_manager")
+    def _default_lease_manager(self):
+        return LeaseManager(parent=self, log=self.log)
+
+    require_lease = Bool(
+        False,
+        config=True,
+        help="""Require a valid edit lease (fencing token) for every write operation.
+
+        When False (default), leases are opt-in: requests that carry a lease
+        token are validated against it, and legacy requests without a token
+        behave as before. When True, save, rename, delete and checkpoint
+        restore requests without a valid token are rejected with a
+        recoverable 409 conflict.
+        """,
+    )
+
+    def _lease_file_state(self, path):
+        """项目内部接口说明。"""
+        return None
+
+    def _check_lease(self, path, lease, op):
+        """项目内部接口说明。"""
+        if lease is None:
+            if self.require_lease:
+                raise LeaseConflictError.required(path, op)
+            return
+        lease_id = lease.get("lease_id")
+        generation = lease.get("generation")
+        if not lease_id or generation is None:
+            raise HTTPError(400, "A lease requires both lease_id and generation")
+        self.lease_manager.validate(
+            path, lease_id, generation, op=op, file_state=self._lease_file_state(path)
+        )
+
+    def _replay_request(self, path, lease, op):
+        """项目内部接口说明。"""
+        if not lease:
+            return None
+        request_id = lease.get("request_id")
+        if not request_id:
+            return None
+        prior = self.lease_manager.lookup_request(path, request_id)
+        if prior is not None and prior.get("op") != op:
+            raise LeaseConflictError.duplicate_request(path, request_id, prior)
+        return prior
+
+    def _record_lease_request(self, path, lease, op, result_path=None):
+        """项目内部接口说明。"""
+        if lease is None:
+            return
+        self.lease_manager.note_file_state(path, self._lease_file_state(path))
+        request_id = lease.get("request_id")
+        if request_id:
+            self.lease_manager.record_request(
+                path, request_id, {"op": op, "path": result_path or path}
+            )
+
+    @contextmanager
+    def _lease_write_guard(self, path, lease, op):
+        """项目内部接口说明。"""
+        if lease is None and not self.require_lease:
+            yield
+            return
+        with self.lease_manager.guard(path):
+            self._check_lease(path, lease, op)
+            yield
+            self._record_lease_request(path, lease, op)
+
+    @asynccontextmanager
+    async def _lease_write_aguard(self, path, lease, op):
+        """项目内部接口说明。"""
+        if lease is None and not self.require_lease:
+            yield
+            return
+        async with self.lease_manager.aguard(path):
+            self._check_lease(path, lease, op)
+            yield
+            self._record_lease_request(path, lease, op)
+
+    # Lease lifecycle passthroughs. These are synchronous for both manager
+    # variants because the LeaseManager itself performs no async I/O.
+
+    def open_lease(self, path, holder, ttl=None):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        return self.lease_manager.acquire(
+            path, holder=holder, ttl=ttl, file_state=self._lease_file_state(path)
+        )
+
+    def renew_lease(self, path, lease_id, generation, ttl=None):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        return self.lease_manager.renew(path, lease_id, generation, ttl=ttl)
+
+    def release_lease(self, path, lease_id, generation):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        self.lease_manager.release(path, lease_id, generation)
+
+    def takeover_lease(self, path, holder, reason, ttl=None, by=None):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        return self.lease_manager.takeover(
+            path,
+            holder=holder,
+            reason=reason,
+            ttl=ttl,
+            by=by,
+            file_state=self._lease_file_state(path),
+        )
+
+    def inspect_lease(self, path):
+        """项目内部接口说明。"""
+        path = path.strip("/")
+        return self.lease_manager.inspect(path)
+
     files_handler_class = Type(
         FilesHandler,
         klass=RequestHandler,
@@ -375,7 +496,7 @@ class ContentsManager(LoggingConfigurable):
         """项目内部接口说明。"""
         raise NotImplementedError
 
-    def save(self, model, path):
+    def save(self, model, path, lease=None):
         """项目内部接口说明。"""
         raise NotImplementedError
 
@@ -390,27 +511,55 @@ class ContentsManager(LoggingConfigurable):
     # ContentsManager API part 2: methods that have usable default
     # implementations, but can be overridden in subclasses.
 
-    def delete(self, path):
+    def delete(self, path, lease=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
-        self.delete_file(path)
-        self.checkpoints.delete_all_checkpoints(path)
+        if self._replay_request(path, lease, "delete") is not None:
+            self.log.info("Ignoring duplicate delete request for %s", path)
+            return
+        with self._lease_write_guard(path, lease, "delete"):
+            self.delete_file(path)
+            self.checkpoints.delete_all_checkpoints(path)
+            if lease is not None:
+                self.lease_manager.void(path, ended_by="delete")
         self.emit(data={"action": "delete", "path": path})
 
-    def rename(self, old_path, new_path):
+    def rename(self, old_path, new_path, lease=None):
         """项目内部接口说明。"""
-        self.rename_file(old_path, new_path)
-        self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        if self._replay_request(old_path, lease, "rename") is not None:
+            self.log.info("Ignoring duplicate rename request for %s", old_path)
+            return
+        if lease is None and not self.require_lease:
+            self.rename_file(old_path, new_path)
+            self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        else:
+            with self.lease_manager.guard(old_path, new_path):
+                self._check_lease(old_path, lease, "rename")
+                self.lease_manager.validate_transfer(old_path, new_path)
+                self.rename_file(old_path, new_path)
+                self.checkpoints.rename_all_checkpoints(old_path, new_path)
+                if lease is not None:
+                    self.lease_manager.transfer(old_path, new_path)
+                    self.lease_manager.note_file_state(new_path, self._lease_file_state(new_path))
+                    request_id = lease.get("request_id")
+                    if request_id:
+                        self.lease_manager.record_request(
+                            old_path, request_id, {"op": "rename", "path": new_path}
+                        )
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
-    def update(self, model, path):
+    def update(self, model, path, lease=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         new_path = model.get("path", path).strip("/")
         if path != new_path:
-            self.rename(path, new_path)
+            self.rename(path, new_path, lease=lease)
+        elif lease is not None:
+            self._check_lease(path, lease, "update")
         model = self.get(new_path, content=False)
         return model
 
@@ -491,7 +640,7 @@ class ContentsManager(LoggingConfigurable):
         path = f"{path}/{name}"
         return self.new(model, path)
 
-    def new(self, model=None, path=""):
+    def new(self, model=None, path="", lease=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if model is None:
@@ -512,8 +661,11 @@ class ContentsManager(LoggingConfigurable):
                 model["type"] = "file"
                 model["format"] = "text"
 
-        model = self.save(model, path)
-        return model
+        if lease is not None:
+            if not supports_lease_kwarg(self.save):
+                raise HTTPError(400, "The configured contents manager does not support edit leases")
+            return self.save(model, path, lease=lease)
+        return self.save(model, path)
 
     def copy(self, from_path, to_path=None):
         """项目内部接口说明。"""
@@ -600,13 +752,28 @@ class ContentsManager(LoggingConfigurable):
         return not any(fnmatch(name, glob) for glob in self.hide_globs)
 
     # Part 3: Checkpoints API
-    def create_checkpoint(self, path):
+    def create_checkpoint(self, path, lease=None):
         """项目内部接口说明。"""
-        return self.checkpoints.create_checkpoint(self, path)
+        path = path.strip("/")
+        if lease is not None:
+            # A checkpoint records the lease generation it was taken under,
+            # but creating one never extends the lease or its write window.
+            with self.lease_manager.guard(path):
+                self._check_lease(path, lease, "checkpoint")
+                model = self.checkpoints.create_checkpoint(self, path)
+            model["lease_generation"] = lease.get("generation")
+        else:
+            model = self.checkpoints.create_checkpoint(self, path)
+        return model
 
-    def restore_checkpoint(self, checkpoint_id, path):
+    def restore_checkpoint(self, checkpoint_id, path, lease=None):
         """项目内部接口说明。"""
-        self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        path = path.strip("/")
+        if self._replay_request(path, lease, "restore") is not None:
+            self.log.info("Ignoring duplicate restore request for %s", path)
+            return
+        with self._lease_write_guard(path, lease, "restore"):
+            self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
 
     def list_checkpoints(self, path):
         return self.checkpoints.list_checkpoints(path)
@@ -658,7 +825,7 @@ class AsyncContentsManager(ContentsManager):
         """项目内部接口说明。"""
         raise NotImplementedError
 
-    async def save(self, model, path):
+    async def save(self, model, path, lease=None):
         """项目内部接口说明。"""
         raise NotImplementedError
 
@@ -677,28 +844,55 @@ class AsyncContentsManager(ContentsManager):
         """项目内部接口说明。"""
         return None
 
-    async def delete(self, path):
+    async def delete(self, path, lease=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if not path:
             raise HTTPError(400, "Can't delete root")
-
-        await self.delete_file(path)
-        await self.checkpoints.delete_all_checkpoints(path)
+        if self._replay_request(path, lease, "delete") is not None:
+            self.log.info("Ignoring duplicate delete request for %s", path)
+            return
+        async with self._lease_write_aguard(path, lease, "delete"):
+            await self.delete_file(path)
+            await self.checkpoints.delete_all_checkpoints(path)
+            if lease is not None:
+                self.lease_manager.void(path, ended_by="delete")
         self.emit(data={"action": "delete", "path": path})
 
-    async def rename(self, old_path, new_path):
+    async def rename(self, old_path, new_path, lease=None):
         """项目内部接口说明。"""
-        await self.rename_file(old_path, new_path)
-        await self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        old_path = old_path.strip("/")
+        new_path = new_path.strip("/")
+        if self._replay_request(old_path, lease, "rename") is not None:
+            self.log.info("Ignoring duplicate rename request for %s", old_path)
+            return
+        if lease is None and not self.require_lease:
+            await self.rename_file(old_path, new_path)
+            await self.checkpoints.rename_all_checkpoints(old_path, new_path)
+        else:
+            async with self.lease_manager.aguard(old_path, new_path):
+                self._check_lease(old_path, lease, "rename")
+                self.lease_manager.validate_transfer(old_path, new_path)
+                await self.rename_file(old_path, new_path)
+                await self.checkpoints.rename_all_checkpoints(old_path, new_path)
+                if lease is not None:
+                    self.lease_manager.transfer(old_path, new_path)
+                    self.lease_manager.note_file_state(new_path, self._lease_file_state(new_path))
+                    request_id = lease.get("request_id")
+                    if request_id:
+                        self.lease_manager.record_request(
+                            old_path, request_id, {"op": "rename", "path": new_path}
+                        )
         self.emit(data={"action": "rename", "path": new_path, "source_path": old_path})
 
-    async def update(self, model, path):
+    async def update(self, model, path, lease=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         new_path = model.get("path", path).strip("/")
         if path != new_path:
-            await self.rename(path, new_path)
+            await self.rename(path, new_path, lease=lease)
+        elif lease is not None:
+            self._check_lease(path, lease, "update")
         model = await self.get(new_path, content=False)
         return model
 
@@ -752,7 +946,7 @@ class AsyncContentsManager(ContentsManager):
         path = f"{path}/{name}"
         return await self.new(model, path)
 
-    async def new(self, model=None, path=""):
+    async def new(self, model=None, path="", lease=None):
         """项目内部接口说明。"""
         path = path.strip("/")
         if model is None:
@@ -773,8 +967,11 @@ class AsyncContentsManager(ContentsManager):
                 model["type"] = "file"
                 model["format"] = "text"
 
-        model = await self.save(model, path)
-        return model
+        if lease is not None:
+            if not supports_lease_kwarg(self.save):
+                raise HTTPError(400, "The configured contents manager does not support edit leases")
+            return await self.save(model, path, lease=lease)
+        return await self.save(model, path)
 
     async def copy(self, from_path, to_path=None):
         """项目内部接口说明。"""
@@ -823,13 +1020,28 @@ class AsyncContentsManager(ContentsManager):
         self.check_and_sign(nb, path)
 
     # Part 3: Checkpoints API
-    async def create_checkpoint(self, path):
+    async def create_checkpoint(self, path, lease=None):
         """项目内部接口说明。"""
-        return await self.checkpoints.create_checkpoint(self, path)
+        path = path.strip("/")
+        if lease is not None:
+            # A checkpoint records the lease generation it was taken under,
+            # but creating one never extends the lease or its write window.
+            async with self.lease_manager.aguard(path):
+                self._check_lease(path, lease, "checkpoint")
+                model = await self.checkpoints.create_checkpoint(self, path)
+            model["lease_generation"] = lease.get("generation")
+        else:
+            model = await self.checkpoints.create_checkpoint(self, path)
+        return model
 
-    async def restore_checkpoint(self, checkpoint_id, path):
+    async def restore_checkpoint(self, checkpoint_id, path, lease=None):
         """项目内部接口说明。"""
-        await self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
+        path = path.strip("/")
+        if self._replay_request(path, lease, "restore") is not None:
+            self.log.info("Ignoring duplicate restore request for %s", path)
+            return
+        async with self._lease_write_aguard(path, lease, "restore"):
+            await self.checkpoints.restore_checkpoint(self, checkpoint_id, path)
 
     async def list_checkpoints(self, path):
         """项目内部接口说明。"""

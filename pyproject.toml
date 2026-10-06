@@ -175,6 +175,7 @@ testpaths = [
     "tests/auth/test_security.py",
     "tests/auth/test_utils.py",
     "tests/extension",
+    "tests/services/contents/test_leases.py",
     "tests/services/contents/test_manager.py",
     "tests/services/contents/test_checkpoints.py",
     "tests/services/sessions/test_manager.py",

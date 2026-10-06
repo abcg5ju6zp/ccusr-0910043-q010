@@ -18,7 +18,18 @@ from jupyter_server.auth.decorator import allow_unauthenticated, authorized
 from jupyter_server.base.handlers import APIHandler, JupyterHandler, path_regex
 from jupyter_server.utils import url_escape, url_path_join
 
+from .leases import LeaseConflictError, supports_lease_kwarg
+
 AUTH_RESOURCE = "contents"
+
+
+def _call_with_lease(method, *args, lease, **kwargs):
+    """项目内部接口说明。"""
+    if lease is None:
+        return method(*args, **kwargs)
+    if not supports_lease_kwarg(method):
+        raise web.HTTPError(400, "The configured contents manager does not support edit leases")
+    return method(*args, lease=lease, **kwargs)
 
 
 def _validate_keys(expect_defined: bool, model: dict[str, Any], keys: list[str]):
@@ -72,6 +83,74 @@ class ContentsAPIHandler(APIHandler):
     """项目内部接口说明。"""
 
     auth_resource = AUTH_RESOURCE
+
+    def write_error(self, status_code: int, **kwargs: Any) -> None:
+        """项目内部接口说明。"""
+        exc_info = kwargs.get("exc_info")
+        if exc_info and isinstance(exc_info[1], LeaseConflictError):
+            error = exc_info[1]
+            self.set_header("Content-Type", "application/json")
+            self.finish(
+                json.dumps(
+                    {
+                        "message": error.log_message or "Edit lease conflict",
+                        "reason": error.reason,
+                        "lease_conflict": error.conflict,
+                    },
+                    default=json_default,
+                )
+            )
+            return
+        super().write_error(status_code, **kwargs)
+
+    def _lease_from_request(self, model: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        """项目内部接口说明。"""
+        lease: dict[str, Any] = {}
+        if model:
+            body_lease = model.pop("lease", None)
+            if body_lease is not None:
+                if not isinstance(body_lease, dict):
+                    raise web.HTTPError(400, "lease must be an object")
+                lease.update(body_lease)
+        headers = self.request.headers
+        for header, key in (
+            ("X-Jupyter-Lease-Id", "lease_id"),
+            ("X-Jupyter-Lease-Generation", "generation"),
+            ("X-Jupyter-Request-Id", "request_id"),
+        ):
+            value = headers.get(header)
+            if value:
+                lease[key] = value
+        for argument, key in (
+            ("lease_id", "lease_id"),
+            ("lease_generation", "generation"),
+            ("request_id", "request_id"),
+        ):
+            value = self.get_query_argument(argument, None)
+            if value is not None:
+                lease[key] = value
+        if not lease:
+            return None
+        if "generation" in lease:
+            try:
+                lease["generation"] = int(lease["generation"])
+            except (TypeError, ValueError):
+                raise web.HTTPError(400, "Lease generation must be an integer") from None
+        return lease
+
+    def _lease_actor(self) -> Any:
+        """项目内部接口说明。"""
+        user = self.current_user
+        if user is None:
+            return None
+        username = getattr(user, "username", None)
+        if username:
+            return username
+        if isinstance(user, dict):
+            return user.get("username")
+        if isinstance(user, str):
+            return user
+        return None
 
 
 class ContentsHandler(ContentsAPIHandler):
@@ -182,7 +261,8 @@ class ContentsHandler(ContentsAPIHandler):
         ):
             raise web.HTTPError(400, f"Cannot rename file or directory {path!r}")
 
-        model = await ensure_async(cm.update(model, path))
+        lease = self._lease_from_request(model)
+        model = await ensure_async(_call_with_lease(cm.update, model, path, lease=lease))
         validate_model(model)
         self._finish_model(model)
 
@@ -198,10 +278,12 @@ class ContentsHandler(ContentsAPIHandler):
         validate_model(model)
         self._finish_model(model)
 
-    async def _upload(self, model, path):
+    async def _upload(self, model, path, lease=None):
         """项目内部接口说明。"""
         self.log.info("Uploading file to %s", path)
-        model = await ensure_async(self.contents_manager.new(model, path))
+        model = await ensure_async(
+            _call_with_lease(self.contents_manager.new, model, path, lease=lease)
+        )
         self.set_status(201)
         validate_model(model)
         self._finish_model(model)
@@ -216,12 +298,16 @@ class ContentsHandler(ContentsAPIHandler):
         validate_model(model)
         self._finish_model(model)
 
-    async def _save(self, model, path):
+    async def _save(self, model, path, lease=None):
         """项目内部接口说明。"""
         chunk = model.get("chunk", None)
         if not chunk or chunk == -1:  # Avoid tedious log information
             self.log.info("Saving file at %s", path)
-        model = await ensure_async(self.contents_manager.save(model, path))
+        if lease is None:
+            lease = self._lease_from_request(model)
+        model = await ensure_async(
+            _call_with_lease(self.contents_manager.save, model, path, lease=lease)
+        )
         validate_model(model)
         self._finish_model(model)
 
@@ -277,10 +363,11 @@ class ContentsHandler(ContentsAPIHandler):
             if model.get("type", "") not in {None, "", "directory", "file", "notebook"}:
                 # fall back to file if unknown type
                 model["type"] = "file"
+            lease = self._lease_from_request(model)
             if exists:
-                await self._save(model, path)
+                await self._save(model, path, lease=lease)
             else:
-                await self._upload(model, path)
+                await self._upload(model, path, lease=lease)
         else:
             await self._new_untitled(path)
 
@@ -294,7 +381,8 @@ class ContentsHandler(ContentsAPIHandler):
             raise web.HTTPError(400, f"Cannot delete file or directory {path!r}")
 
         self.log.warning("delete %s", path)
-        await ensure_async(cm.delete(path))
+        lease = self._lease_from_request()
+        await ensure_async(_call_with_lease(cm.delete, path, lease=lease))
         self.set_status(204)
         self.finish()
 
@@ -316,7 +404,8 @@ class CheckpointsHandler(ContentsAPIHandler):
     async def post(self, path=""):
         """项目内部接口说明。"""
         cm = self.contents_manager
-        checkpoint = await ensure_async(cm.create_checkpoint(path))
+        lease = self._lease_from_request()
+        checkpoint = await ensure_async(_call_with_lease(cm.create_checkpoint, path, lease=lease))
         data = json.dumps(checkpoint, default=json_default)
         location = url_path_join(
             self.base_url,
@@ -338,7 +427,10 @@ class ModifyCheckpointsHandler(ContentsAPIHandler):
     async def post(self, path, checkpoint_id):
         """项目内部接口说明。"""
         cm = self.contents_manager
-        await ensure_async(cm.restore_checkpoint(checkpoint_id, path))
+        lease = self._lease_from_request()
+        await ensure_async(
+            _call_with_lease(cm.restore_checkpoint, checkpoint_id, path, lease=lease)
+        )
         self.set_status(204)
         self.finish()
 
@@ -350,6 +442,112 @@ class ModifyCheckpointsHandler(ContentsAPIHandler):
         await ensure_async(cm.delete_checkpoint(checkpoint_id, path))
         self.set_status(204)
         self.finish()
+
+
+class LeaseHandler(ContentsAPIHandler):
+    """项目内部接口说明。"""
+
+    async def _check_hidden(self, path):
+        """项目内部接口说明。"""
+        cm = self.contents_manager
+        if not cm.allow_hidden and await ensure_async(cm.is_hidden(path)):
+            raise web.HTTPError(404, f"file or directory {path!r} does not exist")
+
+    @web.authenticated
+    @authorized
+    async def get(self, path=""):
+        """项目内部接口说明。"""
+        await self._check_hidden(path)
+        cm = self.contents_manager
+        view = await ensure_async(cm.inspect_lease(path))
+        self.finish(json.dumps(view, default=json_default))
+
+    @web.authenticated
+    @authorized
+    async def post(self, path=""):
+        """项目内部接口说明。"""
+        await self._check_hidden(path)
+        cm = self.contents_manager
+        body = self.get_json_body() or {}
+        holder = body.get("holder")
+        if not isinstance(holder, str) or not holder.strip():
+            raise web.HTTPError(400, "A lease holder is required")
+        lease, created = await ensure_async(cm.open_lease(path, holder=holder, ttl=body.get("ttl")))
+        self.set_status(201 if created else 200)
+        self.finish(json.dumps(lease, default=json_default))
+
+    @web.authenticated
+    @authorized
+    async def put(self, path=""):
+        """项目内部接口说明。"""
+        await self._check_hidden(path)
+        cm = self.contents_manager
+        body = self.get_json_body()
+        if body is None:
+            raise web.HTTPError(400, "JSON body missing")
+        lease_id = body.get("lease_id")
+        generation = body.get("generation")
+        if not lease_id or generation is None:
+            raise web.HTTPError(400, "lease_id and generation are required")
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            raise web.HTTPError(400, "generation must be an integer") from None
+        lease = await ensure_async(cm.renew_lease(path, lease_id, generation, ttl=body.get("ttl")))
+        self.finish(json.dumps(lease, default=json_default))
+
+    @web.authenticated
+    @authorized
+    async def delete(self, path=""):
+        """项目内部接口说明。"""
+        await self._check_hidden(path)
+        cm = self.contents_manager
+        body = self.get_json_body() or {}
+        lease_id = body.get("lease_id") or self.get_query_argument("lease_id", None)
+        generation = body.get("generation")
+        if generation is None:
+            generation = self.get_query_argument("lease_generation", None)
+        if not lease_id or generation is None:
+            raise web.HTTPError(400, "lease_id and generation are required")
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            raise web.HTTPError(400, "generation must be an integer") from None
+        await ensure_async(cm.release_lease(path, lease_id, generation))
+        self.set_status(204)
+        self.finish()
+
+
+class LeaseTakeoverHandler(ContentsAPIHandler):
+    """项目内部接口说明。"""
+
+    @web.authenticated
+    @authorized
+    async def post(self, path=""):
+        """项目内部接口说明。"""
+        cm = self.contents_manager
+        if not cm.allow_hidden and await ensure_async(cm.is_hidden(path)):
+            raise web.HTTPError(404, f"file or directory {path!r} does not exist")
+        body = self.get_json_body()
+        if body is None:
+            raise web.HTTPError(400, "JSON body missing")
+        holder = body.get("holder")
+        reason = body.get("reason")
+        if not isinstance(holder, str) or not holder.strip():
+            raise web.HTTPError(400, "A lease holder is required")
+        if not isinstance(reason, str) or not reason.strip():
+            raise web.HTTPError(400, "A takeover reason is required")
+        lease = await ensure_async(
+            cm.takeover_lease(
+                path,
+                holder=holder,
+                reason=reason,
+                ttl=body.get("ttl"),
+                by=self._lease_actor(),
+            )
+        )
+        self.set_status(201)
+        self.finish(json.dumps(lease, default=json_default))
 
 
 class NotebooksRedirectHandler(JupyterHandler):
@@ -399,6 +597,8 @@ default_handlers = [
         rf"/api/contents{path_regex}/checkpoints/{_checkpoint_id_regex}",
         ModifyCheckpointsHandler,
     ),
+    (r"/api/contents%s/lease/takeover" % path_regex, LeaseTakeoverHandler),
+    (r"/api/contents%s/lease" % path_regex, LeaseHandler),
     (r"/api/contents%s/trust" % path_regex, TrustNotebooksHandler),
     (r"/api/contents%s" % path_regex, ContentsHandler),
     (r"/api/notebooks/?(.*)", NotebooksRedirectHandler),
